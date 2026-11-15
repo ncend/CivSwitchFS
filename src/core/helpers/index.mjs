@@ -45,7 +45,8 @@ import {
   checkPathPairQuiet,
   queryCanaryHealth,
   nulWrites,
-  analyzeWave
+  analyzeWave,
+  applyTimingToFrames
 } from "./wave.mjs";
 
 export function createFspIdentityHelpers(options = {}) {
@@ -91,6 +92,7 @@ export function createFspIdentityHelpers(options = {}) {
     checkPathPairQuiet,
     queryCanaryHealth,
     nulWrites,
-    analyzeWave
+    analyzeWave,
+    applyTimingToFrames
   };
 }

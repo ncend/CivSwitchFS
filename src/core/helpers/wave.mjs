@@ -15,6 +15,7 @@ const {
   cmifReply,
   collectSpans,
   extractRoleTimings,
+  frameArgSlot,
   prepPacket,
   qualifyOverlap,
   read32,
@@ -92,6 +93,58 @@ export function buildPlans(input) {
         plans.push(steps);
     }
     return plans;
+}
+
+// SLEEP step index for each programmable role. buildPlans() puts the role
+// delay in step 1 for W0-W9, in step 2 for the two guards, and the trigger
+// (W12) uses fixed sleeps that are not retuned.
+var ROLE_SLEEP_STEP = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2];
+
+// Rewrite the embedded SLEEP durations after a mid-campaign retune.
+// buildPlans() bakes config.roleDelays/guardDelays into the raw frames once,
+// and resetWaveState() restores those frames from their backups before every
+// wave, so both copies must be patched for the new schedule to take effect.
+// previousConfig, when supplied, is the schedule currently embedded in the
+// frames; each slot is checked before it is written so a wrong step index
+// cannot silently corrupt a frame.
+export function applyTimingToFrames(config, waveData, previousConfig) {
+    var frames = waveData && waveData.frames;
+    var backups = waveData && waveData.backups;
+    if (!Array.isArray(frames) || !Array.isArray(backups) ||
+        frames.length < ROLE_SLEEP_STEP.length ||
+        backups.length < ROLE_SLEEP_STEP.length) return false;
+
+    var slots = [];
+    for (var role = 0; role < ROLE_SLEEP_STEP.length; role++) {
+        var delay = role < 10
+            ? config.roleDelays[role]
+            : config.guardDelays[role - 10];
+        if (!Number.isSafeInteger(delay) || delay < 0) return false;
+        var count = frames[role].count;
+        var liveSlot = frameArgSlot(frames[role].frame, count,
+            ROLE_SLEEP_STEP[role], 0);
+        var backupSlot = frameArgSlot(backups[role], count,
+            ROLE_SLEEP_STEP[role], 0);
+        if (previousConfig) {
+            var previous = role < 10
+                ? previousConfig.roleDelays[role]
+                : previousConfig.guardDelays[role - 10];
+            if (!Number.isSafeInteger(previous)) return false;
+            // The backup is never executed, so it is the authoritative copy
+            // of the programmed sleep. Validate it before touching either
+            // copy; the live frame is restored from the backup before each
+            // wave anyway.
+            if (read64(backupSlot) !== BigInt(previous)) return false;
+        }
+        slots.push({live: liveSlot, backup: backupSlot, value: BigInt(delay)});
+    }
+    // Validate every slot before writing any of them, so a rejected schedule
+    // cannot leave the live frames and the backup frames out of sync.
+    for (var slot = 0; slot < slots.length; slot++) {
+        write64(slots[slot].live, slots[slot].value);
+        write64(slots[slot].backup, slots[slot].value);
+    }
+    return true;
 }
 
 export function configureProfile(profile, input) {

@@ -169,11 +169,25 @@ function copyCanaryTimingSchedule(schedule) {
         !Array.isArray(schedule.guardDelays) ||
         !Array.isArray(schedule.baselineRoleDelays) ||
         !Array.isArray(schedule.baselineGuardDelays)) return null;
+    const probe = schedule.noFlipProbe;
+    const pending = probe && probe.pending;
     return {
         roleDelays: schedule.roleDelays.slice(),
         guardDelays: schedule.guardDelays.slice(),
         baselineRoleDelays: schedule.baselineRoleDelays.slice(),
-        baselineGuardDelays: schedule.baselineGuardDelays.slice()
+        baselineGuardDelays: schedule.baselineGuardDelays.slice(),
+        noFlipProbe: probe && typeof probe === "object" ? {
+            direction: probe.direction === -1 ? -1 : 1,
+            laterFailed: probe.laterFailed === true,
+            earlierFailed: probe.earlierFailed === true,
+            done: probe.done === true,
+            pending: pending && Array.isArray(pending.roleDelays) &&
+                pending.roleDelays.length > 0 &&
+                pending.roleDelays.every(Number.isSafeInteger) ? {
+                    direction: pending.direction === -1 ? -1 : 1,
+                    roleDelays: pending.roleDelays.slice()
+                } : null
+        } : null
     };
 }
 
@@ -364,6 +378,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
     };
     const carriedSchedule = copyCanaryTimingSchedule(
         attemptState.canaryTimingSchedule);
+    let timingProbe = null;
     if (carriedSchedule &&
         carriedSchedule.roleDelays.length === config.roleDelays.length &&
         carriedSchedule.guardDelays.length === config.guardDelays.length &&
@@ -375,6 +390,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
             ...carriedSchedule.guardDelays);
         timingBaseline.roleDelays = carriedSchedule.baselineRoleDelays;
         timingBaseline.guardDelays = carriedSchedule.baselineGuardDelays;
+        timingProbe = carriedSchedule.noFlipProbe;
     }
     const helpers = createFspIdentityHelpers({
         optimizeRootCandidateScan: true,
@@ -593,6 +609,7 @@ async function runPayload(attemptState, allowTimingAdjustments = true) {
         setupPath: scratch.setupPath, setupPkt: scratch.setupPkt,
         triggerBuf: buffers.triggerBuf,
         timingBaseline,
+        timingProbe,
         allowTimingAdjustments
     });
 

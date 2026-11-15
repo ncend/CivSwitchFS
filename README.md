@@ -176,7 +176,10 @@ want to keep it.
 - The promotion (`npm run send`, the race that wins the elevated fs
   session) loses about 1 attempt in 3: `Canary did not flip` means the
   attempt didn't take. Restart the game and retry. If it loses three
-  times in a row, power-cycle the console.
+  times in a row, power-cycle the console. The campaign retunes its own
+  timing between attempts, and mid-campaign after repeated timing misses
+  or valid windows that never flip, so a bad schedule can be corrected
+  without finishing the launch.
 - The layout stage crashes the game without any error output about half
   the time: the log just stops after `DL5` or `FR0` (layout-stage
   markers). Restart the game and retry; nothing launched yet, so the

@@ -25,6 +25,16 @@ const TIMING_MAX_STEP_US = 250;
 const TIMING_MAX_DRIFT_US = 1000;
 const TIMING_MIN_REPEATED_FAILURES = 2;
 const TIMING_MIN_ROLE_GAP_NS = 50000;
+// A valid window with no flip means the overlap shape is right but the flip
+// phase is not. After a run of such windows, nudge the canary in small steps
+// so one campaign can test several phases without abandoning the schedule
+// that produced the windows.
+const TIMING_NO_FLIP_WINDOWS = 5;
+const TIMING_NO_FLIP_STEP_US = 100;
+const TIMING_NO_FLIP_MIN_LEAD_US = 350;
+const TIMING_NO_FLIP_MIN_HOLD_US = 100;
+const TIMING_NO_FLIP_MIN_START_US = 100;
+const TIMING_NO_FLIP_MAX_ADJUSTMENTS = 6;
 // The hard qualification floor is 300µs; target some extra margin.
 const RECEIVE_MARGIN_TARGET_US = 500;
 
@@ -64,6 +74,7 @@ export async function runControlWaveLoop({
   setupPath,
   setupPkt,
   timingBaseline = null,
+  timingProbe = null,
   allowTimingAdjustments = true
 }) {
   let canaryQualified;
@@ -105,6 +116,118 @@ export async function runControlWaveLoop({
     var baseline = timingBaseline || {
         roleDelays: config.roleDelays.slice(),
         guardDelays: config.guardDelays.slice()
+    };
+    var probeState = timingProbe || {};
+    var carriedPending = probeState.pending;
+    var retune = {
+        lastWave: 0,
+        noFlipStreak: 0,
+        noFlipDirection: probeState.direction === -1 ? -1 : 1,
+        noFlipAdjustments: 0,
+        noFlipPending: null,
+        // A direction that lost windows stays failed across attempts, so the
+        // next attempt does not repeat the same probe from the same phase.
+        laterFailed: probeState.laterFailed === true,
+        earlierFailed: probeState.earlierFailed === true,
+        phase: probeState.done === true ? "done" : "later"
+    };
+    if (carriedPending && Array.isArray(carriedPending.roleDelays) &&
+        carriedPending.roleDelays.length === config.roleDelays.length) {
+        // The previous attempt ended on an unvalidated flip-phase nudge. Keep
+        // its pre-probe schedule so the next attempt can roll it back.
+        retune.noFlipPending = {
+            wave: 0,
+            failures: 0,
+            direction: carriedPending.direction === -1 ? -1 : 1,
+            roleDelays: carriedPending.roleDelays.slice()
+        };
+    }
+
+    // Apply a schedule change and make the live frames match it. A failed
+    // frame patch restores the previous schedule so the config and the raw
+    // threads never disagree.
+    var applyTimingChange = function(produceChanges, reason, source,
+            recordChange) {
+        if (!allowTimingAdjustments || canaryQualified) return [];
+        var roleDelaysBefore = config.roleDelays.slice();
+        var guardDelaysBefore = config.guardDelays.slice();
+        var changes = produceChanges();
+        if (!changes || changes.length === 0) return [];
+        if (!helpers.applyTimingToFrames(config, waveData, {
+                roleDelays: roleDelaysBefore,
+                guardDelays: guardDelaysBefore
+            })) {
+            config.roleDelays.splice(0, config.roleDelays.length,
+                ...roleDelaysBefore);
+            config.guardDelays.splice(0, config.guardDelays.length,
+                ...guardDelaysBefore);
+            return [];
+        }
+        if (recordChange !== false) {
+            for (var ci = 0; ci < changes.length; ci++) {
+                timingAdjustments.push({
+                    afterWave: wavesJoined,
+                    reason: reason,
+                    source: source,
+                    ...changes[ci]
+                });
+            }
+        }
+        retune.lastWave = wavesJoined;
+        return changes;
+    };
+
+    // A flip-phase nudge is a probe: if the following waves lose the window,
+    // restore the pre-probe schedule and remember that direction failed.
+    var rollbackNoFlipProbe = function() {
+        var pendingNoFlip = retune.noFlipPending;
+        retune.noFlipPending = null;
+        if (pendingNoFlip.direction > 0) retune.laterFailed = true;
+        else retune.earlierFailed = true;
+        retune.noFlipDirection = pendingNoFlip.direction > 0 ? -1 : 1;
+        if (retune.laterFailed && retune.earlierFailed)
+            retune.phase = "done";
+        var canaryIndex = config.roleLabels.indexOf("canary");
+        var nudgedCanary = config.roleDelays[canaryIndex];
+        applyTimingChange(function() {
+            config.roleDelays.splice(0, config.roleDelays.length,
+                ...pendingNoFlip.roleDelays);
+            return [{role: "canary",
+                deltaUs: (config.roleDelays[canaryIndex] - nudgedCanary) / 1000,
+                delayNs: config.roleDelays[canaryIndex]}];
+        }, "no-flip-probe-window-lost", "positive", false);
+    };
+
+    // Validate a carried or fresh probe on the first windows measured after
+    // it. Positive, extent-present, and negative profiles all measure the
+    // same overlap margin, so any of them can show that the probe hurt.
+    var validateNoFlipProbe = function(wResult) {
+        if (!retune.noFlipPending) return;
+        if (wResult.window || wResult.observedCanaryRedirect) {
+            retune.noFlipPending = null;
+        } else if (++retune.noFlipPending.failures >=
+                TIMING_MIN_REPEATED_FAILURES) {
+            rollbackNoFlipProbe();
+        }
+    };
+
+    var applyNoFlipProbe = function(lastWindowRecord) {
+        if (!lastWindowRecord) return [];
+        var noFlipBefore = config.roleDelays.slice();
+        var changes = applyTimingChange(function() {
+            return applyNoFlipTimingAdjustment(config, baseline,
+                lastWindowRecord, retune);
+        }, "positive-window-valid-no-flip", "positive");
+        if (changes.length) {
+            retune.noFlipStreak = 0;
+            retune.noFlipPending = {
+                wave: wavesJoined,
+                failures: 0,
+                direction: changes[0].direction,
+                roleDelays: noFlipBefore
+            };
+        }
+        return changes;
     };
 
     for (var attempt = 0; attempt < config.MAX_CONTROL_WAVES; attempt++) {
@@ -277,6 +400,74 @@ export async function runControlWaveLoop({
             nextProfile = "positive";
         }
 
+        // Retune during the campaign instead of only after it. A schedule
+        // that keeps failing the same gate must not consume the whole wave
+        // budget unchanged, and a schedule that qualifies windows without
+        // flipping needs its flip phase moved while the attempt is still live.
+        if (profile === "positive" || profile === "extent-present" ||
+                profile === "negative") {
+            validateNoFlipProbe(wResult);
+        }
+
+        if (profile === "positive") {
+            retune.noFlipStreak = wResult.window &&
+                wResult.canaryResult === 0 && wResult.canaryType === 1 &&
+                wResult.postCanaryHealth.healthy
+                ? retune.noFlipStreak + 1 : 0;
+
+            var retunePositive = positiveWindowRecords.filter(function(record) {
+                return record.wave > retune.lastWave;
+            });
+            var recentFailures = retunePositive.filter(function(record) {
+                return !record.window;
+            }).length;
+            var recentWindows = retunePositive.length - recentFailures;
+            var timingChanged = false;
+            if (!canaryQualified &&
+                    recentFailures >= TIMING_MIN_REPEATED_FAILURES &&
+                    recentWindows / retunePositive.length <
+                        WINDOW_RATE_THRESHOLD) {
+                timingChanged = applyTimingChange(function() {
+                    return applyTimingAdjustments(retunePositive, config,
+                        baseline, false);
+                }, "repeated-positive-timing-gate-failure", "positive").length > 0;
+                if (timingChanged) retune.noFlipStreak = 0;
+            }
+            if (!timingChanged && !canaryQualified &&
+                    retune.noFlipStreak >= TIMING_NO_FLIP_WINDOWS &&
+                    retune.noFlipAdjustments <
+                        TIMING_NO_FLIP_MAX_ADJUSTMENTS) {
+                var lastWindowRecord = null;
+                for (var rp = retunePositive.length - 1; rp >= 0; rp--) {
+                    if (retunePositive[rp].window &&
+                        retunePositive[rp].canaryResult === 0 &&
+                        retunePositive[rp].canaryType === 1 &&
+                        retunePositive[rp].postHealthy) {
+                        lastWindowRecord = retunePositive[rp];
+                        break;
+                    }
+                }
+                applyNoFlipProbe(lastWindowRecord);
+            }
+        } else if (profile === "extent-present" || profile === "negative") {
+            var retuneControl = waveTimingRecords.filter(function(record) {
+                return record.wave > retune.lastWave &&
+                    (record.profile === "extent-present" ||
+                     record.profile === "negative");
+            });
+            if (retuneControl.filter(function(record) {
+                    return !record.window;
+                }).length >= TIMING_MIN_REPEATED_FAILURES &&
+                retuneControl.filter(function(record) {
+                    return record.window;
+                }).length / retuneControl.length < WINDOW_RATE_THRESHOLD) {
+                applyTimingChange(function() {
+                    return applyTimingAdjustments(retuneControl, config,
+                        baseline, true);
+                }, "repeated-control-timing-gate-failure", "control");
+            }
+        }
+
         verboseWaveLines.push(helpers.formatWaveSummaryLine(
             attempt + 1, profile, wResult,
             wResult.window ? "QUALIFIED" : "REJECTED", {config}));
@@ -288,36 +479,59 @@ export async function runControlWaveLoop({
     for (const line of verboseWaveLines) await log(line);
 
     const positiveAttempts = profileCounts.positive || 0;
-    let timingRecords = null;
-    let timingSource = null;
-    if (positiveAttempts > 0 &&
-        positiveWindows / positiveAttempts < WINDOW_RATE_THRESHOLD) {
-        timingRecords = positiveWindowRecords;
-        timingSource = "positive";
-    } else if (positiveAttempts === 0) {
-        // Extent-present and negative controls use the same worker schedule
-        // and measure the same overlap margin as positive waves. Exclude the
-        // deliberate abort controls and extent-absent profile.
-        const controlRecords = waveTimingRecords.filter(record =>
-            record.profile === "extent-present" || record.profile === "negative");
-        const controlWindows = controlRecords.filter(record => record.window).length;
-        if (controlRecords.length >= TIMING_MIN_REPEATED_FAILURES &&
-            controlWindows / controlRecords.length < WINDOW_RATE_THRESHOLD) {
-            timingRecords = controlRecords;
-            timingSource = "control";
-        }
-    }
 
-    if (allowTimingAdjustments && !canaryQualified && timingRecords) {
-        const changes = applyTimingAdjustments(timingRecords, config, baseline,
-            timingSource === "control");
-        for (const change of changes) {
-            timingAdjustments.push({
-                afterWave: wavesJoined,
-                reason: timingSource + "-window-rate-below-50-percent",
-                source: timingSource,
-                ...change
-            });
+    // Only retune on waves measured under the current schedule. After a
+    // mid-campaign change, samples from the old schedule are stale.
+    const recentTimingRecords = waveTimingRecords.filter(record =>
+        record.wave > retune.lastWave);
+    const recentPositiveRecords = positiveWindowRecords.filter(record =>
+        record.wave > retune.lastWave);
+    const recentPositiveAttempts = recentPositiveRecords.length;
+    const recentPositiveWindows =
+        recentPositiveRecords.filter(record => record.window).length;
+
+    if (allowTimingAdjustments && !canaryQualified &&
+        recentTimingRecords.length > 0) {
+        if (recentPositiveAttempts > 0 &&
+            recentPositiveWindows / recentPositiveAttempts <
+                WINDOW_RATE_THRESHOLD) {
+            applyTimingChange(() => applyTimingAdjustments(
+                recentPositiveRecords, config, baseline, false),
+                "positive-window-rate-below-50-percent", "positive");
+        } else if (recentPositiveAttempts === 0) {
+            // Extent-present and negative controls use the same worker
+            // schedule and measure the same overlap margin as positive waves.
+            // Exclude the deliberate abort controls and extent-absent profile.
+            const controlRecords = recentTimingRecords.filter(record =>
+                record.profile === "extent-present" ||
+                record.profile === "negative");
+            const controlWindows =
+                controlRecords.filter(record => record.window).length;
+            if (controlRecords.length >= TIMING_MIN_REPEATED_FAILURES &&
+                controlWindows / controlRecords.length <
+                    WINDOW_RATE_THRESHOLD) {
+                applyTimingChange(() => applyTimingAdjustments(
+                    controlRecords, config, baseline, true),
+                    "control-window-rate-below-50-percent", "control");
+            }
+        } else if (recentPositiveWindows >= TIMING_MIN_REPEATED_FAILURES &&
+                retune.noFlipAdjustments < TIMING_NO_FLIP_MAX_ADJUSTMENTS) {
+            // The windows are fine but the flip never happened. Carry a
+            // flip-phase change into the next attempt instead of repeating
+            // the same schedule.
+            let lastWindowRecord = null;
+            for (let rp = recentPositiveRecords.length - 1; rp >= 0; rp--) {
+                if (recentPositiveRecords[rp].window &&
+                    recentPositiveRecords[rp].canaryResult === 0 &&
+                    recentPositiveRecords[rp].canaryType === 1 &&
+                    recentPositiveRecords[rp].postHealthy) {
+                    lastWindowRecord = recentPositiveRecords[rp];
+                    break;
+                }
+            }
+            if (lastWindowRecord) {
+                applyNoFlipProbe(lastWindowRecord);
+            }
         }
     }
 
@@ -355,7 +569,17 @@ export async function runControlWaveLoop({
           baselineRoleDelays: baseline.roleDelays.slice(),
           baselineGuardDelays: baseline.guardDelays.slice(),
           roleDelays: config.roleDelays.slice(),
-          guardDelays: config.guardDelays.slice()
+          guardDelays: config.guardDelays.slice(),
+          noFlipProbe: {
+              direction: retune.noFlipDirection,
+              laterFailed: retune.laterFailed === true,
+              earlierFailed: retune.earlierFailed === true,
+              done: retune.phase === "done",
+              pending: retune.noFlipPending ? {
+                  direction: retune.noFlipPending.direction,
+                  roleDelays: retune.noFlipPending.roleDelays.slice()
+              } : null
+          }
       },
       pinQualificationDiagnostics};
 }
@@ -489,4 +713,91 @@ function applyTimingAdjustments(records, config, baseline,
 
   delays[delayIndex] = after;
   return [{role, deltaUs: actualStepUs, delayNs: after}];
+}
+
+// Window-valid-no-flip correction. The overlap shape is already correct, so
+// do not touch the release/guards (that would move the qualified window);
+// move the canary GetEntryType closer to (or, after the later sweep is
+// blocked, further from) the trigger instead. Fillers are re-spaced only as
+// needed to preserve the programmed start order.
+function applyNoFlipTimingAdjustment(config, baseline, record, state) {
+  if (!state || state.phase === "done" ||
+      state.noFlipAdjustments >= TIMING_NO_FLIP_MAX_ADJUSTMENTS) return [];
+  const canaryIndex = config.roleLabels.indexOf("canary");
+  const releaseIndex = config.roleLabels.indexOf("release");
+  if (canaryIndex < 1 || canaryIndex + 3 >= config.roleDelays.length ||
+      releaseIndex !== canaryIndex + 3) return [];
+
+  const canaryTiming = record && record.roleTimings && record.roleTimings.canary;
+  const leadUs = canaryTiming ? -canaryTiming.relStartUs : null;
+
+  const tryDirection = direction => {
+    if (direction > 0 && state.laterFailed) return [];
+    if (direction < 0 && state.earlierFailed) return [];
+    if (direction > 0 && leadUs !== null &&
+        leadUs - TIMING_NO_FLIP_STEP_US < TIMING_NO_FLIP_MIN_LEAD_US)
+      return [];
+    if (direction < 0 && canaryTiming &&
+        canaryTiming.relEndUs - TIMING_NO_FLIP_STEP_US <
+            TIMING_NO_FLIP_MIN_HOLD_US)
+      return [];
+    const before = config.roleDelays[canaryIndex];
+    const after = before + direction * TIMING_NO_FLIP_STEP_US * 1000;
+    const baseCanary = baseline.roleDelays[canaryIndex];
+    const minDelay = Math.max(0,
+        config.roleDelays[canaryIndex - 1] + TIMING_MIN_ROLE_GAP_NS,
+        baseCanary - TIMING_MAX_DRIFT_US * 1000);
+    const maxDelay = Math.min(
+        config.roleDelays[releaseIndex] - 2 * TIMING_MIN_ROLE_GAP_NS,
+        baseCanary + TIMING_MAX_DRIFT_US * 1000);
+    if (after < minDelay || after > maxDelay) return [];
+
+    let filler0 = config.roleDelays[canaryIndex + 1];
+    let filler1 = config.roleDelays[canaryIndex + 2];
+    const currentFiller0 = filler0;
+    const currentFiller1 = filler1;
+    filler0 = Math.max(filler0, after + TIMING_MIN_ROLE_GAP_NS);
+    filler1 = Math.max(filler1, filler0 + TIMING_MIN_ROLE_GAP_NS);
+    if (filler0 > baseline.roleDelays[canaryIndex + 1] +
+            TIMING_MAX_DRIFT_US * 1000 ||
+        filler1 > baseline.roleDelays[canaryIndex + 2] +
+            TIMING_MAX_DRIFT_US * 1000 ||
+        filler1 + TIMING_MIN_ROLE_GAP_NS >
+            config.roleDelays[releaseIndex]) return [];
+
+    // Held requests must still start before the trigger and be running when
+    // it starts. Moving a filler later eats into both margins.
+    const timing = record && record.roleTimings ? record.roleTimings : {};
+    const push0 = (filler0 - currentFiller0) / 1000;
+    const push1 = (filler1 - currentFiller1) / 1000;
+    if ((push0 > 0 && timing.filler0 &&
+            (timing.filler0.relEndUs - push0 < TIMING_NO_FLIP_MIN_HOLD_US ||
+             timing.filler0.relStartUs + push0 >
+                -TIMING_NO_FLIP_MIN_START_US)) ||
+        (push1 > 0 && timing.filler1 &&
+            (timing.filler1.relEndUs - push1 < TIMING_NO_FLIP_MIN_HOLD_US ||
+             timing.filler1.relStartUs + push1 >
+                -TIMING_NO_FLIP_MIN_START_US)))
+        return [];
+
+    config.roleDelays[canaryIndex] = after;
+    config.roleDelays[canaryIndex + 1] = filler0;
+    config.roleDelays[canaryIndex + 2] = filler1;
+    return [{role: "canary", deltaUs: (after - before) / 1000,
+      delayNs: after, direction}];
+  };
+
+  let direction = state.noFlipDirection;
+  let changes = tryDirection(direction);
+  if (changes.length === 0) {
+    const alternate = -direction;
+    changes = tryDirection(alternate);
+    if (changes.length === 0) {
+      state.phase = "done";
+      return [];
+    }
+    state.noFlipDirection = alternate;
+  }
+  state.noFlipAdjustments++;
+  return changes;
 }

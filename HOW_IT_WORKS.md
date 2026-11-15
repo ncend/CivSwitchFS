@@ -39,15 +39,19 @@ alias. If the retirement wave is not qualified, a readback must show the
 candidate's original bytes at the aliased offset before retrying. A failure to
 close an ordinary handle is reported but does not by itself block the retry.
 Attempt buffers are freed after workers and cleanup IPC have ended, even when
-ordinary handles remain open. Each timing adjustment adds one attempt to the
-budget, up to 30 total, so every changed schedule gets a chance to run. The
-30th attempt is reserved for validation and does not retune again. Retuning
-requires fewer than half of the positive waves to qualify and at least two
-waves failing the same timing gate alone; overlap retuning also requires one
-recurring role to stand out. It moves one parameter per campaign and preserves
-at least 50 microseconds between adjacent programmed start offsets. At the
-retry cap, a cumulative qualified-window rate of at least 50% prompts a game
-restart before another run.
+ordinary handles remain open. Each attempt that changes the schedule adds one
+attempt to the budget, up to 30 total, so the final schedule gets a chance to
+run. The 30th attempt is reserved for validation and does not retune again.
+Retuning happens during a campaign as well as between attempts: two waves
+failing the same timing gate alone while fewer than half the recent windows
+qualify move one parameter, and repeated qualified windows that did not flip
+move the canary's start offset. A flip-phase move that starts losing windows
+is rolled back, and the next probe tries the other direction; a direction that
+lost windows is not retried. Both stay within a bounded drift and preserve at
+least 50 microseconds between adjacent programmed start offsets, so a failing
+schedule does not consume the rest of the wave budget unchanged. At the retry
+cap, a cumulative qualified-window rate of at least 50% prompts a game restart
+before another run.
 
 [`src/core/steps/setup.mjs`](src/core/steps/setup.mjs) opens an `fsp-srv`
 session, clones the mounted save filesystem, creates a temporary `save:/hole`
